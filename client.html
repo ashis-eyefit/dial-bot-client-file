@@ -1,0 +1,20 @@
+<!DOCTYPE html>
+<html>
+<head><title>AI Voice Test</title></head>
+<body>
+<h2>AI Voice Test</h2>
+<button onclick="startClient()">Start</button>
+<button onclick="stopClient()">Stop</button>
+
+<script>
+async function startClient() {
+  await fetch("https://f67178a00feb.ngrok-free.app/start_client",{method:"POST"});
+  alert("Client started");
+}
+async function stopClient() {
+  await fetch("https://f67178a00feb.ngrok-free.app/stop_client",{method:"POST"});
+  alert("Client stop signal sent");
+}
+</script>
+</body>
+</html>
