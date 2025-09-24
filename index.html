@@ -1,14 +1,12 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-<meta charset="utf-8"/>
-<title>Voice Bot (robust)</title>
-<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<meta charset="utf-8" />
+<title>Voice Bot – Robust</title>
 <style>
-  body { font-family: Arial, Helvetica, sans-serif; text-align:center; padding:36px; }
-  button { padding:12px 20px; margin:8px; font-size:16px; cursor:pointer; }
-  #status { margin-top:12px; font-weight:600; }
-  #log { margin-top:12px; font-size:13px; color:#444; max-width:720px; margin-left:auto; margin-right:auto; text-align:left; }
+  body { font-family: Arial, sans-serif; text-align:center; padding:40px; }
+  button { padding:12px 20px; margin:8px; font-size:16px; }
+  #status { margin-top:12px; font-weight:bold; }
 </style>
 </head>
 <body>
@@ -16,272 +14,178 @@
   <button id="startBtn">Start Mic</button>
   <button id="stopBtn" disabled>Stop Mic</button>
   <div id="status">Idle</div>
-  <pre id="log"></pre>
 
 <script>
-/*
-  Robust browser client for asr_stream:
-  - Connects to NGROK_WS (wss) and streams PCM16 @16k from mic
-  - Receives WAV binary frames from server and plays in queue
-  - Resamples client audio to 16000 if needed
-*/
+/* ---------------- CONFIG ---------------- */
+const NGROK_WS = "wss://f67178a00feb.ngrok-free.app/asr/ws";   // <- UPDATE THIS
+const SAMPLE_RATE = 16000;
 
-const NGROK_WS = "wss://f67178a00feb.ngrok-free.app/asr/ws"; // <- SET your ngrok wss /asr/ws URL
-const TARGET_RATE = 16000;
-const FRAME_SAMPLES = 320; // we'll send in multiples of framesize (320 bytes = 160 samples -> use multiples)
-
-const startBtn = document.getElementById('startBtn');
-const stopBtn  = document.getElementById('stopBtn');
-const statusEl = document.getElementById('status');
-const logEl    = document.getElementById('log');
-
-let audioCtx = null;
-let mediaStream = null;
-let sourceNode = null;
-let processor = null;
-let silentGain = null;
-let ws = null;
+/* ------------- STATE VARIABLES ---------- */
+let audioCtx;           // Playback AudioContext
+let micCtx;             // Recording AudioContext
+let mediaStream;
+let processor;
+let sourceNode;
+let ws;
 let running = false;
-
-let sendBuffer = new Float32Array(0); // float buffer before resample
-let pcmSendQueue = []; // for debug/inspection
-
-// Playback queue
 let playQueue = [];
 let playing = false;
 
-function log(...args){ console.log(...args); logEl.textContent = (new Date()).toISOString() + " › " + args.join(' ') + "\n" + logEl.textContent; }
-function setStatus(s, color='black'){ statusEl.textContent = s; statusEl.style.color = color; }
+const statusEl = document.getElementById('status');
+const startBtn = document.getElementById('startBtn');
+const stopBtn = document.getElementById('stopBtn');
 
-async function ensureAudioContext() {
-  if (!audioCtx) {
-    audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: TARGET_RATE });
-  }
-  if (audioCtx.state === 'suspended') await audioCtx.resume();
+/* ------------ UI Helpers ---------------- */
+function setStatus(s, color='black') {
+  statusEl.textContent = s;
+  statusEl.style.color = color;
 }
 
-// simple linear resample from Float32Array at srcRate -> targetRate
-function resampleFloat32(src, srcRate, targetRate) {
-  if (srcRate === targetRate) return src;
-  const ratio = srcRate / targetRate;
-  const outLength = Math.floor(src.length / ratio);
-  const out = new Float32Array(outLength);
-  for (let i=0; i<outLength; i++) {
-    const idx = i * ratio;
-    const idx0 = Math.floor(idx);
-    const idx1 = Math.min(src.length - 1, idx0 + 1);
-    const frac = idx - idx0;
-    out[i] = src[idx0] * (1 - frac) + src[idx1] * frac;
-  }
-  return out;
-}
-
-function floatTo16BitPCM(float32Array){
-  const len = float32Array.length;
-  const buffer = new ArrayBuffer(len * 2);
-  const view = new DataView(buffer);
-  for (let i = 0; i < len; i++) {
-    let s = Math.max(-1, Math.min(1, float32Array[i]));
-    view.setInt16(i*2, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
-  }
-  return buffer;
-}
-
-// enqueue/ play WAV ArrayBuffer
-async function playWavArrayBuffer(ab){
-  try{
-    if (!audioCtx) await ensureAudioContext();
-    // decodeAudioData accepts ArrayBuffer
-    const decoded = await audioCtx.decodeAudioData(ab.slice(0));
-    const src = audioCtx.createBufferSource();
-    src.buffer = decoded;
-    src.connect(audioCtx.destination);
-    src.onended = () => {
+/* ------------ Playback Helpers ---------- */
+async function playWavArrayBuffer(ab) {
+  try {
+    const decoded = await audioCtx.decodeAudioData(ab);
+    const out = audioCtx.createBufferSource();
+    out.buffer = decoded;
+    out.connect(audioCtx.destination);
+    out.onended = () => {
       playing = false;
-      if (playQueue.length) playQueue.shift() && playWavArrayBuffer(playQueue.shift());
+      if (playQueue.length) playWavArrayBuffer(playQueue.shift());
     };
     playing = true;
-    src.start();
-  }catch(err){
-    console.error("play error", err);
-    log("Playback decode error: " + err.message);
-    playing = false;
+    out.start();
+  } catch (e) {
+    console.error("decode/play failed:", e);
   }
 }
 
-function enqueueOrPlay(ab){
+function enqueueOrPlay(ab) {
   if (playing) playQueue.push(ab);
   else playWavArrayBuffer(ab);
 }
 
-function openWebSocket(){
-  if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
-  ws = new WebSocket(NGROK_WS);
-  ws.binaryType = "arraybuffer";
-
-  ws.onopen = () => {
-    log("WebSocket opened");
-    setStatus("Connected to server", "green");
-  };
-
-  ws.onmessage = async (ev) => {
-    if (typeof ev.data === "string") {
-      // text event (JSON) or plain text
-      try {
-        const obj = JSON.parse(ev.data);
-        if (obj.text) setStatus("ASR: " + obj.text, "blue");
-        log("Server JSON: " + JSON.stringify(obj));
-      } catch(e){
-        log("Server text: " + ev.data);
-      }
-      return;
-    }
-    // binary -> expect WAV/MP3 etc. We try to decode via audioCtx
-    try {
+/* ------------ Message Handler ----------- */
+async function handleServerMessage(ev) {
+  try {
+    /* Case 1: Browser gives Blob (true binary) */
+    if (ev.data instanceof Blob) {
       const ab = await ev.data.arrayBuffer();
       enqueueOrPlay(ab);
-      log("Received audio frame (bytes: " + ab.byteLength + ")");
-    } catch(e){
-      console.error("onmessage binary error", e);
-      log("Invalid binary from server: " + e.message);
+      return;
     }
-  };
 
-  ws.onclose = (ev) => {
-    log("WebSocket closed: code=" + ev.code + " reason=" + ev.reason);
-    setStatus("Server disconnected", "red");
-  };
+    /* Case 2: Browser gives ArrayBuffer directly (rare) */
+    if (ev.data instanceof ArrayBuffer) {
+      enqueueOrPlay(ev.data);
+      return;
+    }
 
-  ws.onerror = (err) => {
-    console.error("WS error", err);
-    log("WebSocket error");
-  };
+    /* Case 3: Browser gives string (JSON or plain text) */
+    if (typeof ev.data === "string") {
+      try {
+        const obj = JSON.parse(ev.data);
+        console.log("Server JSON:", obj);
+
+        // Show ASR/NLU text if provided
+        if (obj.text || obj.asr_text) {
+          setStatus("ASR: " + (obj.text || obj.asr_text), "blue");
+        }
+
+        // Base64 audio inside JSON (e.g., {audio_base64:"..."} )
+        const audioKeys = ["audio_base64","audio","tts","tts_audio","wav_base64","data"];
+        for (const key of audioKeys) {
+          if (obj[key] && typeof obj[key] === "string") {
+            const b64 = obj[key];
+            try {
+              const binary = atob(b64);
+              const buf = new Uint8Array(binary.length);
+              for (let i = 0; i < binary.length; i++)
+                buf[i] = binary.charCodeAt(i);
+              enqueueOrPlay(buf.buffer);
+              return;
+            } catch (err) {
+              console.warn("Base64 decode failed for key:", key, err);
+            }
+          }
+        }
+
+        // No audio found → just a text event (e.g., tts_start/tts_end)
+        return;
+      } catch (jsonErr) {
+        console.log("Server text:", ev.data); // plain text (non-JSON)
+        return;
+      }
+    }
+
+    console.warn("Unknown message type:", ev.data);
+  } catch (err) {
+    console.error("onmessage handler error:", err);
+  }
 }
 
-// build a typed Float32 array concatenation helper
-function concatFloat32(a, b) {
-  const out = new Float32Array(a.length + b.length);
-  out.set(a, 0);
-  out.set(b, a.length);
-  return out;
-}
-
+/* ------------ Start / Stop Logic -------- */
 startBtn.onclick = async () => {
   if (running) return;
+
+  audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: SAMPLE_RATE });
+
   try {
-    await ensureAudioContext();                // create & resume inside user gesture
     mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
-  } catch (err) {
-    console.error("getUserMedia failed", err);
-    setStatus("Microphone denied", "red");
-    log("Microphone access denied or not available");
+  } catch (e) {
+    setStatus("Microphone permission denied", "red");
     return;
   }
 
-  // open ws
-  openWebSocket();
+  ws = new WebSocket(NGROK_WS);
+  ws.binaryType = "blob"; // ensures binary frames arrive as Blob when possible
 
-  // create nodes
-  sourceNode = audioCtx.createMediaStreamSource(mediaStream);
-
-  // silent gain so processor stays running but user doesn't hear mic monitor
-  silentGain = audioCtx.createGain();
-  silentGain.gain.value = 0.0;
-
-  processor = audioCtx.createScriptProcessor(1024, 1, 1);
-  processor.onaudioprocess = (e) => {
-    if (!running) return;
-    const input = e.inputBuffer.getChannelData(0); // Float32Array at audioCtx.sampleRate
-    // If audioCtx.sampleRate != TARGET_RATE, resample
-    let float32 = input;
-    if (audioCtx.sampleRate !== TARGET_RATE) {
-      // resample small block: concatenate with leftover and resample when enough
-      // append to sendBuffer and process when enough target samples available
-      sendBuffer = concatFloat32(sendBuffer, float32);
-      const srcRate = audioCtx.sampleRate;
-      const needed = Math.floor(sendBuffer.length * TARGET_RATE / srcRate);
-      if (needed < 128) { // wait until a little accumulates
-        return;
-      }
-      // resample entire sendBuffer
-      const resampled = resampleFloat32(sendBuffer, srcRate, TARGET_RATE);
-      // send in chunks of 160 samples (320 bytes) or multiples
-      let offset = 0;
-      while (offset + 160 <= resampled.length) {
-        const frame = resampled.subarray(offset, offset + 160);
-        const buf = floatTo16BitPCM(frame);
-        if (ws && ws.readyState === WebSocket.OPEN) ws.send(buf);
-        offset += 160;
-      }
-      // keep leftover in sendBuffer (convert leftover back to srcRate domain approx)
-      const leftover = resampled.length - offset;
-      if (leftover > 0) {
-        // convert leftover resampled back to src domain approx: keep last samples of original sendBuffer
-        const keep = Math.max(0, Math.floor(sendBuffer.length - (leftover * srcRate / TARGET_RATE)));
-        sendBuffer = sendBuffer.slice(keep);
-      } else {
-        sendBuffer = new Float32Array(0);
-      }
-      return;
-    }
-
-    // If sample rate already TARGET_RATE
-    const frameSize = input.length;
-    // convert in slices of 160 samples
-    let i = 0;
-    while (i + 160 <= frameSize) {
-      const slice = input.subarray(i, i + 160);
-      const buf = floatTo16BitPCM(slice);
-      if (ws && ws.readyState === WebSocket.OPEN) ws.send(buf);
-      i += 160;
-    }
-    // leftover: keep at front of sendBuffer for next block
-    if (i < frameSize) {
-      sendBuffer = concatFloat32(sendBuffer, input.subarray(i));
-      // sendBuffer might accumulate until we reach 160
-      while (sendBuffer.length >= 160) {
-        const slice = sendBuffer.subarray(0, 160);
-        const buf = floatTo16BitPCM(slice);
-        if (ws && ws.readyState === WebSocket.OPEN) ws.send(buf);
-        sendBuffer = sendBuffer.subarray(160);
-      }
-    }
+  ws.onopen = () => {
+    setStatus("Connected to server", "green");
+    startBtn.disabled = true;
+    stopBtn.disabled = false;
   };
 
-  // connect nodes: source -> processor -> silentGain -> destination (so script runs)
+  ws.onmessage = handleServerMessage;
+
+  ws.onclose = () => {
+    setStatus("Server connection closed", "red");
+  };
+
+  /* Microphone → PCM16 → WebSocket */
+  micCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: SAMPLE_RATE });
+  sourceNode = micCtx.createMediaStreamSource(mediaStream);
+  processor = micCtx.createScriptProcessor(1024, 1, 1);
+
+  processor.onaudioprocess = (e) => {
+    const input = e.inputBuffer.getChannelData(0);
+    const buffer = new ArrayBuffer(input.length * 2);
+    const view = new DataView(buffer);
+    for (let i = 0; i < input.length; i++) {
+      let s = Math.max(-1, Math.min(1, input[i]));
+      view.setInt16(i * 2, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
+    }
+    if (ws && ws.readyState === WebSocket.OPEN) ws.send(buffer);
+  };
+
   sourceNode.connect(processor);
-  processor.connect(silentGain);
-  silentGain.connect(audioCtx.destination);
+  processor.connect(micCtx.destination);
 
   running = true;
-  startBtn.disabled = true;
-  stopBtn.disabled = false;
-  setStatus("Mic active, connected", "green");
-  log("Started microphone streaming");
+  setStatus("Mic active", "green");
 };
 
-stopBtn.onclick = async () => {
+stopBtn.onclick = () => {
   if (!running) return;
   running = false;
-  try { processor.disconnect(); } catch(e){}
-  try { sourceNode.disconnect(); } catch(e){}
-  try { silentGain.disconnect(); } catch(e){}
-  try { mediaStream.getTracks().forEach(t => t.stop()); } catch(e){}
-  if (ws && ws.readyState === WebSocket.OPEN) ws.close();
+
+  try { processor.disconnect(); sourceNode.disconnect(); } catch {}
+  try { mediaStream.getTracks().forEach(t => t.stop()); } catch {}
+  try { ws.close(); } catch {}
+  try { micCtx.close(); } catch {}
   startBtn.disabled = false;
   stopBtn.disabled = true;
   setStatus("Stopped", "black");
-  log("Stopped microphone streaming");
 };
-
-// helpful debug: allow manual play of a received wav base64 string (for testing)
-// usage from console: window.playBase64Audio('<base64 wav>')
-window.playBase64Audio = async (b64) => {
-  if (!audioCtx) await ensureAudioContext();
-  const ab = Uint8Array.from(atob(b64), c=>c.charCodeAt(0)).buffer;
-  enqueueOrPlay(ab);
-};
-
 </script>
 </body>
 </html>
