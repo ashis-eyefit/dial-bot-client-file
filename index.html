@@ -8,19 +8,37 @@
 <h2>Voice Bot</h2>
 <button id="startBtn">Start</button>
 <button id="stopBtn" disabled>Stop</button>
+
 <script>
 let ws;
 let mediaStream;
 let audioContext;
 let processor;
+let audioQueue = [];
+let playing = false;
 
-const WS_URL = "wss://f67178a00feb.ngrok-free.app/asr/ws"; // update with ngrok public URL
+const WS_URL = "wss://f67178a00feb.ngrok-free.app/ws/audio"; // Update
+
+function playAudio(arrayBuffer) {
+    audioContext.decodeAudioData(arrayBuffer).then(audioBuffer => {
+        const source = audioContext.createBufferSource();
+        source.buffer = audioBuffer;
+        source.connect(audioContext.destination);
+        source.onended = () => {
+            playing = false;
+            if (audioQueue.length) {
+                playAudio(audioQueue.shift());
+            }
+        };
+        playing = true;
+        source.start();
+    });
+}
 
 document.getElementById("startBtn").onclick = async () => {
     audioContext = new (window.AudioContext || window.webkitAudioContext)({sampleRate:16000});
     mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
     ws = new WebSocket(WS_URL);
-
     ws.binaryType = "arraybuffer";
 
     ws.onopen = () => {
@@ -33,7 +51,6 @@ document.getElementById("startBtn").onclick = async () => {
 
         processor.onaudioprocess = e => {
             const input = e.inputBuffer.getChannelData(0);
-            // convert float32 to int16 PCM
             const buffer = new ArrayBuffer(input.length * 2);
             const view = new DataView(buffer);
             for (let i = 0; i < input.length; i++) {
@@ -52,13 +69,12 @@ document.getElementById("startBtn").onclick = async () => {
             const json = JSON.parse(event.data);
             console.log("ASR Text:", json.text);
         } else {
-            // Audio bytes from server -> play
             const arrayBuffer = await event.data.arrayBuffer();
-            const audioBuffer = await audioContext.decodeAudioData(arrayBuffer);
-            const outSource = audioContext.createBufferSource();
-            outSource.buffer = audioBuffer;
-            outSource.connect(audioContext.destination);
-            outSource.start();
+            if (playing) {
+                audioQueue.push(arrayBuffer);
+            } else {
+                playAudio(arrayBuffer);
+            }
         }
     };
 };
