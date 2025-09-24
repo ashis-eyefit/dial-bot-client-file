@@ -1,49 +1,64 @@
-<!DOCTYPE html>
-<html>
-<head>
-  <title>AI Voice Bot</title>
-</head>
-<body>
-  <h2>AI Voice Bot Test</h2>
-  <button id="startBtn">Start Conversation</button>
-  <button id="stopBtn">Stop Conversation</button>
+<script>
+(async () => {
+    const ws = new WebSocket(`ws://${window.location.host}/ws/audio`);
+    ws.binaryType = "arraybuffer";
 
-  <script>
-    let ws;
-    let mediaRecorder;
+    // Audio playback setup
+    const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    const sampleRate = 16000; // match your ASR server
+    let audioQueue = [];
 
-    document.getElementById('startBtn').onclick = async () => {
-      ws = new WebSocket('wss://f67178a00feb.ngrok-free.app/asr/ws'); // replace with your ngrok URL
-      ws.binaryType = 'arraybuffer';
-
-      ws.onopen = () => console.log('✅ WebSocket connected');
-      ws.onmessage = async (event) => {
-        if (typeof event.data === 'string') {
-          console.log('Event:', event.data);
-        } else {
-          const audioBlob = new Blob([event.data], { type: 'audio/wav' });
-          const audioUrl = URL.createObjectURL(audioBlob);
-          const audio = new Audio(audioUrl);
-          audio.play();
+    // Decode and play incoming audio bytes from server
+    ws.onmessage = async (event) => {
+        if (typeof event.data === "string") {
+            try {
+                const json = JSON.parse(event.data);
+                console.log("Server event:", json);
+            } catch {
+                console.log("Server text:", event.data);
+            }
+            return;
         }
-      };
 
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      mediaRecorder = new MediaRecorder(stream, { mimeType: 'audio/webm; codecs=opus' });
+        const arrayBuffer = await event.data.arrayBuffer();
+        // Convert PCM16 to Float32 for Web Audio API
+        const pcm16 = new Int16Array(arrayBuffer);
+        const float32 = new Float32Array(pcm16.length);
+        for (let i = 0; i < pcm16.length; i++) {
+            float32[i] = pcm16[i] / 32768;
+        }
 
-      mediaRecorder.ondataavailable = (e) => {
-        if (ws.readyState === WebSocket.OPEN) ws.send(e.data);
-      };
+        const audioBuffer = audioCtx.createBuffer(1, float32.length, sampleRate);
+        audioBuffer.copyToChannel(float32, 0);
 
-      mediaRecorder.start(250); // chunk audio every 250ms
-      console.log('🎙️ Recording started');
+        const source = audioCtx.createBufferSource();
+        source.buffer = audioBuffer;
+        source.connect(audioCtx.destination);
+        source.start();
     };
 
-    document.getElementById('stopBtn').onclick = () => {
-      if (mediaRecorder) mediaRecorder.stop();
-      if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ event: 'stop' }));
-      console.log('🛑 Conversation stopped');
-    };
-  </script>
-</body>
-</html>
+    // Capture microphone and send to server
+    async function startMic() {
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        const micCtx = new AudioContext({ sampleRate });
+        const source = micCtx.createMediaStreamSource(stream);
+        const processor = micCtx.createScriptProcessor(1024, 1, 1);
+
+        source.connect(processor);
+        processor.connect(micCtx.destination);
+
+        processor.onaudioprocess = (e) => {
+            const input = e.inputBuffer.getChannelData(0);
+            const buffer = new ArrayBuffer(input.length * 2);
+            const view = new DataView(buffer);
+            for (let i = 0; i < input.length; i++) {
+                let s = Math.max(-1, Math.min(1, input[i]));
+                view.setInt16(i * 2, s < 0 ? s * 32768 : s * 32767, true);
+            }
+            ws.send(buffer);
+        };
+    }
+
+    startMic().catch(console.error);
+})();
+</script>
