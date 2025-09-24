@@ -1,90 +1,153 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-<meta charset="UTF-8">
-<title>Voice Bot</title>
+<meta charset="utf-8" />
+<title>Voice Bot (robust)</title>
+<style>
+  body { font-family: Arial, sans-serif; text-align:center; padding:40px; }
+  button { padding:12px 20px; margin:8px; font-size:16px; }
+  #status { margin-top:12px; font-weight:bold; }
+</style>
 </head>
 <body>
-<h2>Voice Bot</h2>
-<button id="startBtn">Start</button>
-<button id="stopBtn" disabled>Stop</button>
+  <h1>Voice Bot</h1>
+  <button id="startBtn">Start Mic</button>
+  <button id="stopBtn" disabled>Stop Mic</button>
+  <div id="status">Idle</div>
 
 <script>
-let ws;
+const NGROK_WS = "wss://YOUR_NGROK_ID.ngrok-free.app/ws/audio"; // <- update this
+const SAMPLE_RATE = 16000;
+
+let audioCtx;
 let mediaStream;
-let audioContext;
 let processor;
-let audioQueue = [];
+let sourceNode;
+let ws;
+let running = false;
+let playQueue = [];
 let playing = false;
 
-const WS_URL = "wss://f67178a00feb.ngrok-free.app/ws/audio"; // Update
+const statusEl = document.getElementById('status');
+const startBtn = document.getElementById('startBtn');
+const stopBtn = document.getElementById('stopBtn');
 
-function playAudio(arrayBuffer) {
-    audioContext.decodeAudioData(arrayBuffer).then(audioBuffer => {
-        const source = audioContext.createBufferSource();
-        source.buffer = audioBuffer;
-        source.connect(audioContext.destination);
-        source.onended = () => {
-            playing = false;
-            if (audioQueue.length) {
-                playAudio(audioQueue.shift());
-            }
-        };
-        playing = true;
-        source.start();
-    });
+function setStatus(s, color='black') {
+  statusEl.textContent = s;
+  statusEl.style.color = color;
 }
 
-document.getElementById("startBtn").onclick = async () => {
-    audioContext = new (window.AudioContext || window.webkitAudioContext)({sampleRate:16000});
+async function playWavArrayBuffer(ab) {
+  try {
+    const decoded = await audioCtx.decodeAudioData(ab);
+    const out = audioCtx.createBufferSource();
+    out.buffer = decoded;
+    out.connect(audioCtx.destination);
+    out.onended = () => {
+      playing = false;
+      if (playQueue.length) {
+        playWavArrayBuffer(playQueue.shift());
+      }
+    };
+    playing = true;
+    out.start();
+  } catch (e) {
+    console.error("decode/play failed", e);
+  }
+}
+
+function enqueueOrPlay(ab) {
+  if (playing) playQueue.push(ab);
+  else playWavArrayBuffer(ab);
+}
+
+startBtn.onclick = async () => {
+  if (running) return;
+  audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: SAMPLE_RATE });
+  try {
     mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
-    ws = new WebSocket(WS_URL);
-    ws.binaryType = "arraybuffer";
+  } catch (e) {
+    setStatus("Microphone permission denied", "red");
+    return;
+  }
 
-    ws.onopen = () => {
-        console.log("✅ Connected to ASR WebSocket");
-        document.getElementById("startBtn").disabled = true;
-        document.getElementById("stopBtn").disabled = false;
+  ws = new WebSocket(NGROK_WS);
+  ws.binaryType = "arraybuffer";
 
-        const source = audioContext.createMediaStreamSource(mediaStream);
-        processor = audioContext.createScriptProcessor(1024, 1, 1);
+  ws.onopen = () => {
+    setStatus("Connected to server", "green");
+    startBtn.disabled = true;
+    stopBtn.disabled = false;
+  };
 
-        processor.onaudioprocess = e => {
-            const input = e.inputBuffer.getChannelData(0);
-            const buffer = new ArrayBuffer(input.length * 2);
-            const view = new DataView(buffer);
-            for (let i = 0; i < input.length; i++) {
-                let s = Math.max(-1, Math.min(1, input[i]));
-                view.setInt16(i*2, s < 0 ? s*0x8000 : s*0x7FFF, true);
-            }
-            ws.send(buffer);
-        };
-
-        source.connect(processor);
-        processor.connect(audioContext.destination);
-    };
-
-    ws.onmessage = async (event) => {
-        if (typeof event.data === "string") {
-            const json = JSON.parse(event.data);
-            console.log("ASR Text:", json.text);
-        } else {
-            const arrayBuffer = await event.data.arrayBuffer();
-            if (playing) {
-                audioQueue.push(arrayBuffer);
-            } else {
-                playAudio(arrayBuffer);
-            }
+  ws.onmessage = async (ev) => {
+    // text JSON or binary WAV bytes
+    if (typeof ev.data === "string") {
+      try {
+        const obj = JSON.parse(ev.data);
+        console.log("Server JSON:", obj);
+        if (obj.text) {
+          // show ASR/NLU text if you want
+          setStatus("ASR: " + obj.text, "blue");
         }
-    };
+      } catch (e) {
+        console.log("Server text:", ev.data);
+      }
+      return;
+    }
+
+    // binary data (we expect WAV bytes)
+    try {
+      const ab = await ev.data.arrayBuffer();
+      enqueueOrPlay(ab);
+    } catch (e) {
+      console.error("Failed to handle binary:", e);
+    }
+  };
+
+  ws.onclose = () => {
+    setStatus("Server connection closed", "red");
+  };
+
+  // create processing pipeline
+  const localCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: SAMPLE_RATE });
+  sourceNode = localCtx.createMediaStreamSource(mediaStream);
+  processor = localCtx.createScriptProcessor(1024, 1, 1);
+
+  processor.onaudioprocess = (e) => {
+    const input = e.inputBuffer.getChannelData(0);
+    const buffer = new ArrayBuffer(input.length * 2);
+    const view = new DataView(buffer);
+    for (let i = 0; i < input.length; i++) {
+      let s = Math.max(-1, Math.min(1, input[i]));
+      view.setInt16(i * 2, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
+    }
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(buffer);
+    }
+  };
+
+  sourceNode.connect(processor);
+  processor.connect(localCtx.destination);
+
+  audioCtx = localCtx;
+  running = true;
+  setStatus("Mic active", "green");
 };
 
-document.getElementById("stopBtn").onclick = () => {
+stopBtn.onclick = () => {
+  if (!running) return;
+  running = false;
+
+  try {
     processor.disconnect();
-    mediaStream.getTracks().forEach(track => track.stop());
-    ws.close();
-    document.getElementById("startBtn").disabled = false;
-    document.getElementById("stopBtn").disabled = true;
+    sourceNode.disconnect();
+  } catch (e) {}
+  try { mediaStream.getTracks().forEach(t => t.stop()); } catch {}
+  try { ws.close(); } catch {}
+  startBtn.disabled = false;
+  stopBtn.disabled = true;
+  setStatus("Stopped", "black");
 };
 </script>
 </body>
