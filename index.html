@@ -1,20 +1,49 @@
 <!DOCTYPE html>
 <html>
-<head><title>AI Voice Test</title></head>
+<head>
+  <title>AI Voice Bot</title>
+</head>
 <body>
-<h2>AI Voice Test</h2>
-<button onclick="startClient()">Start</button>
-<button onclick="stopClient()">Stop</button>
+  <h2>AI Voice Bot Test</h2>
+  <button id="startBtn">Start Conversation</button>
+  <button id="stopBtn">Stop Conversation</button>
 
-<script>
-async function startClient() {
-  await fetch("https://f67178a00feb.ngrok-free.app/start_client",{method:"POST"});
-  alert("Client started");
-}
-async function stopClient() {
-  await fetch("https://f67178a00feb.ngrok-free.app/stop_client",{method:"POST"});
-  alert("Client stop signal sent");
-}
-</script>
+  <script>
+    let ws;
+    let mediaRecorder;
+
+    document.getElementById('startBtn').onclick = async () => {
+      ws = new WebSocket('wss://f67178a00feb.ngrok-free.app/asr/ws'); // replace with your ngrok URL
+      ws.binaryType = 'arraybuffer';
+
+      ws.onopen = () => console.log('✅ WebSocket connected');
+      ws.onmessage = async (event) => {
+        if (typeof event.data === 'string') {
+          console.log('Event:', event.data);
+        } else {
+          const audioBlob = new Blob([event.data], { type: 'audio/wav' });
+          const audioUrl = URL.createObjectURL(audioBlob);
+          const audio = new Audio(audioUrl);
+          audio.play();
+        }
+      };
+
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      mediaRecorder = new MediaRecorder(stream, { mimeType: 'audio/webm; codecs=opus' });
+
+      mediaRecorder.ondataavailable = (e) => {
+        if (ws.readyState === WebSocket.OPEN) ws.send(e.data);
+      };
+
+      mediaRecorder.start(250); // chunk audio every 250ms
+      console.log('🎙️ Recording started');
+    };
+
+    document.getElementById('stopBtn').onclick = () => {
+      if (mediaRecorder) mediaRecorder.stop();
+      if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ event: 'stop' }));
+      console.log('🛑 Conversation stopped');
+    };
+  </script>
 </body>
 </html>
