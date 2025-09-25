@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="utf-8" />
-<title>Voice Bot – Robust</title>
+<title>Voice Eye Assistant</title>
 <style>
   body { font-family: Arial, sans-serif; text-align:center; padding:40px; }
   button { padding:12px 20px; margin:8px; font-size:16px; }
@@ -10,14 +10,15 @@
 </style>
 </head>
 <body>
-  <h1>Voice Bot</h1>
-  <button id="startBtn">Start Mic</button>
-  <button id="stopBtn" disabled>Stop Mic</button>
+  <h1 style="color: blue;font-size: large;">Eye Assistant</h1>
+  <p>Kindly, click stop talking button after the discussion, other wise it will be continuousely capturing your voice</p>
+  <button id="startBtn" style="color: green; padding: 5px;">Start talking</button>
+  <button id="stopBtn" disabled style="color: green; padding: 5px;">Stop talking</button>
   <div id="status">Idle</div>
 
 <script>
 /* ---------------- CONFIG ---------------- */
-const NGROK_WS = "wss://f67178a00feb.ngrok-free.app/asr/ws";   // <- UPDATE THIS
+const NGROK_WS = "wss://568eca15393f.ngrok-free.app/asr/ws";   // <- UPDATE THIS
 const SAMPLE_RATE = 16000;
 
 /* ------------- STATE VARIABLES ---------- */
